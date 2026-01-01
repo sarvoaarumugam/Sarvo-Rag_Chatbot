@@ -1,6 +1,9 @@
 
 import os
 import asyncio
+import tempfile
+import shutil
+from fastapi import UploadFile, File
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from pydantic import BaseModel
@@ -367,6 +370,146 @@ def get_rag_chatbot():
     return rag_chatbot
 
 # API ENDPOINTS 
+@router.post("/upload-document")
+async def upload_document(file: UploadFile = File(...)):
+    """
+    UPLOAD DOCUMENT ENDPOINT
+    
+    Accepts a PDF file upload and processes it into the VectorDB
+    
+    EXAMPLE:
+    POST /api/upload-document
+    Content-Type: multipart/form-data
+    file: [PDF file]
+    """
+    try:
+        # Validate file type
+        if not file.filename.endswith('.pdf'):
+            raise HTTPException(status_code=400, detail="Only PDF files are allowed")
+        
+        # Create a temporary file to store the upload
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
+            # Copy uploaded file to temp file
+            shutil.copyfileobj(file.file, temp_file)
+            temp_path = temp_file.name
+        
+        try:
+            # Read the PDF
+            with open(temp_path, 'rb') as pdf_file:
+                pdf_reader = PyPDF2.PdfReader(pdf_file)
+                text = ""
+                
+                for page_num in range(len(pdf_reader.pages)):
+                    page = pdf_reader.pages[page_num]
+                    text += page.extract_text()
+            
+            # Create document object
+            doc = {
+                "content": text,
+                "source": file.filename,
+                "page_count": len(pdf_reader.pages)
+            }
+            
+            # Get RAG instance
+            rag = get_rag_chatbot()
+            
+            # Check if already processed
+            doc_hash = rag.vector_store.get_document_hash(doc["content"])
+            
+            if rag.vector_store.is_document_processed(doc_hash):
+                return {
+                    "success": False,
+                    "message": f"Document '{file.filename}' already exists in the knowledge base",
+                    "filename": file.filename,
+                    "already_exists": True
+                }
+            
+            # Process the document
+            print(f"\n📄 Processing uploaded file: {file.filename}")
+            
+            chunks = chunk_text(doc["content"])
+            embeddings = await generate_embeddings(chunks)
+            
+            if not embeddings:
+                raise HTTPException(status_code=500, detail="Failed to generate embeddings")
+            
+            metadatas = [
+                {
+                    "source": doc["source"],
+                    "page_count": doc["page_count"],
+                    "chunk_index": i,
+                    "type": "content"
+                }
+                for i in range(len(chunks))
+            ]
+            
+            rag.vector_store.add_documents(
+                chunks, 
+                embeddings, 
+                metadatas,
+                document_hash=doc_hash
+            )
+            
+            rag.is_ready = True
+            
+            print(f"✅ Successfully processed: {file.filename}")
+            
+            return {
+                "success": True,
+                "message": f"Successfully processed '{file.filename}'",
+                "filename": file.filename,
+                "page_count": doc["page_count"],
+                "chunks_created": len(chunks)
+            }
+            
+        finally:
+            # Clean up temp file
+            import os
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error processing upload: {e}")
+        raise HTTPException(status_code=500, detail=f"Error processing document: {str(e)}")
+
+# Also add this endpoint to get list of documents
+@router.get("/documents")
+async def get_documents():
+    """
+    GET DOCUMENTS LIST
+    
+    Returns list of all documents in the knowledge base
+    """
+    rag = get_rag_chatbot()
+    
+    try:
+        # Get all items from collection
+        results = rag.vector_store.collection.get(
+            where={"type": "content"},
+            include=["metadatas"]
+        )
+        
+        # Extract unique sources
+        sources = set()
+        for metadata in results['metadatas']:
+            if 'source' in metadata:
+                sources.add(metadata['source'])
+        
+        return {
+            "success": True,
+            "documents": sorted(list(sources)),
+            "count": len(sources)
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "documents": [],
+            "count": 0,
+            "error": str(e)
+        }
+    
 @router.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """
